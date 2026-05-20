@@ -7778,7 +7778,23 @@ def _update_node_dependencies() -> None:
             print(f"    {stderr.splitlines()[-1]}")
 
 
-class _UpdateOutputStream:
+class _UpdateOutputStreamMeta(type):
+    """Keep ``isinstance`` stable if ``hermes_cli.main`` is reloaded in tests.
+
+    Some test paths reload ``hermes_cli.main`` after importing
+    ``_UpdateOutputStream`` at module scope. The reloaded module creates a
+    fresh class object, so a normal ``isinstance`` check against the earlier
+    imported class can fail even though the object is the same wrapper type.
+    Treat wrappers carrying our private marker as instances across reloads.
+    """
+
+    def __instancecheck__(cls, instance):  # noqa: D105
+        if getattr(instance, "_hermes_update_output_stream", False) is True:
+            return True
+        return super().__instancecheck__(instance)
+
+
+class _UpdateOutputStream(metaclass=_UpdateOutputStreamMeta):
     """Stream wrapper used during ``hermes update`` to survive terminal loss.
 
     Wraps the process's original stdout/stderr so that:
@@ -7795,6 +7811,8 @@ class _UpdateOutputStream:
     ``_install_hangup_protection``, this makes ``hermes update`` safe to
     run in a plain SSH session that might disconnect mid-install.
     """
+
+    _hermes_update_output_stream = True
 
     def __init__(self, original, log_file):
         self._original = original
@@ -10319,7 +10337,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "config", "cron", "curator", "dashboard", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "kanban", "login", "logout", "logs", "lsp", "mcp", "memory",
-        "model", "pairing", "plugins", "postinstall", "profile", "proxy",
+        "migrate", "model", "pairing", "plugins", "postinstall", "profile", "proxy",
         "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "chat",
