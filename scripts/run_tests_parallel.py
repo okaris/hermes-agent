@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shlex
 import subprocess
 import sys
 import threading
@@ -56,6 +55,12 @@ _DEFAULT_ROOTS = ["tests"]
 # require real services and are run separately. Match exactly the
 # ``--ignore=`` flags the previous CI command used.
 _SKIP_PARTS = {"integration", "e2e"}
+
+# Per-file wall-clock cap. Generous default — pytest-timeout still
+# enforces per-test caps inside each subprocess; this is just an outer
+# safety net so a single hung file can't stall the whole suite. Override
+# via --file-timeout or HERMES_TEST_FILE_TIMEOUT.
+_DEFAULT_FILE_TIMEOUT_SECONDS = 600.0  # 10 minutes
 
 
 def _discover_files(roots: List[Path]) -> List[Path]:
@@ -79,10 +84,99 @@ def _discover_files(roots: List[Path]) -> List[Path]:
     return sorted(out)
 
 
+def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
+    """Kill the pytest subprocess and every descendant it spawned.
+
+    A test run can spin up uvicorn servers, async runtimes, or other
+    long-running grandchildren that survive the pytest subprocess exit
+    if we don't kill the whole tree. ``subprocess.Popen.kill()`` only
+    targets the immediate child; grandchildren reparent to PID 1
+    (Linux) / get adopted by services.exe (Windows) and leak.
+
+    Strategy (preferred, both platforms): use ``psutil`` to walk the
+    parent-child tree and SIGKILL every descendant + the root. This
+    works on Linux, macOS, and Windows; psutil is already a core
+    dependency.
+
+    POSIX fast path: if ``pgid`` was captured immediately after Popen
+    (via ``os.getpgid(proc.pid)``), prefer ``os.killpg`` first — it's
+    one syscall and atomically kills the whole process group even when
+    the leader has already been reaped and removed from the process
+    table. psutil's tree walk requires the root to still be visible,
+    so it can miss descendants whose leader has been reaped. We still
+    run the psutil walk after killpg as a backstop for any process that
+    was spawned with its own session.
+
+    Windows: psutil only; no killpg concept. ``taskkill /F /T /PID``
+    is an alternative, but psutil is more reliable when descendants
+    have already been reparented.
+    """
+    if proc.pid is None:
+        return
+
+    # POSIX fast path: kill the whole process group atomically, even if
+    # the leader is gone. Defined inline rather than at module level so
+    # signal.SIGKILL is never referenced on Windows (where the attribute
+    # does not exist).
+    if sys.platform != "win32" and pgid is not None:
+        try:
+            import signal as _signal  # local import, POSIX-only branch
+            os.killpg(pgid, _signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, AttributeError, OSError):
+            # AttributeError defends against a stripped-down platform
+            # where SIGKILL isn't present; the psutil walk below still
+            # gets a chance to do its job.
+            pass
+
+    # psutil tree walk: handles Windows + serves as a POSIX backstop
+    # for any process that detached into its own session.
+    try:
+        import psutil
+    except ImportError:
+        # psutil missing — fall back to just killing the immediate child.
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+        return
+
+    try:
+        root = psutil.Process(proc.pid)
+    except psutil.NoSuchProcess:
+        # Root already gone. Descendants (if any) reparented and are
+        # unreachable by tree walk now — the killpg above is our only
+        # shot, and we already took it.
+        return
+
+    # Snapshot children BEFORE killing root (the snapshot is stable
+    # even after the root dies).
+    try:
+        descendants = root.children(recursive=True)
+    except psutil.NoSuchProcess:
+        descendants = []
+
+    for victim in (*descendants, root):
+        try:
+            victim.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    # Best-effort reap: wait briefly for everyone to actually die so
+    # subprocess.communicate() can return.
+    psutil.wait_procs((*descendants, root), timeout=5.0)
+
+    # Belt-and-suspenders: ensure subprocess sees the exit.
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+
+
 def _run_one_file(
     file: Path,
     pytest_args: List[str],
     repo_root: Path,
+    file_timeout: float,
 ) -> Tuple[Path, int, str]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
@@ -100,25 +194,76 @@ def _run_one_file(
     skipped or filtered by a marker (e.g. ``-m 'not integration'`` skips
     files where every test is marked integration). That's intentional and
     not a failure mode.
+
+    On per-file timeout (``file_timeout`` seconds) or any other exception
+    during ``communicate()``, we kill the whole process group / process
+    tree so grandchildren (uvicorn servers, async runtimes, etc.) do not
+    orphan onto PID 1. The pytest-timeout plugin enforces per-test
+    timeouts inside the subprocess; this outer timeout exists only to
+    bound a pathologically slow or hung file as a whole.
     """
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
         cwd=repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        # No timeout here: pytest-timeout in the child enforces per-test
-        # timeouts. A whole-file timeout would need to be huge to allow
-        # for slow files (some have 100+ tests) and adds little safety.
+        # POSIX: place the child at the head of its own process group so
+        # _kill_tree can SIGKILL the group atomically.
+        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
+        # _kill_tree handles the Windows path via taskkill /F /T.
+        start_new_session=True,
     )
-    rc = proc.returncode
+
+    # Capture the pgid NOW, before the leader can exit and be reaped.
+    # Once the leader is reaped, os.getpgid(proc.pid) raises
+    # ProcessLookupError even though grandchildren in that group are
+    # still alive — defeating the whole cleanup. None on Windows where
+    # the pgid concept doesn't apply (taskkill walks ppid chain instead).
+    pgid: int | None = None
+    if sys.platform != "win32":
+        try:
+            pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, PermissionError):
+            # Astonishingly fast child? Already dead. _kill_tree's
+            # fallback will handle this case as a no-op.
+            pgid = None
+
+    try:
+        output, _ = proc.communicate(timeout=file_timeout)
+        rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc, pgid=pgid)
+        # Drain whatever the child wrote before we killed it so we have
+        # something to surface in the failure dump.
+        try:
+            output, _ = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            output = "(file timeout exceeded; output unavailable)"
+        rc = 124  # de facto convention for "killed by timeout".
+        output = (
+            f"(per-file timeout: {file_timeout:.0f}s exceeded; "
+            f"process tree SIGKILL'd)\n{output}"
+        )
+    except BaseException:
+        # KeyboardInterrupt / runner crash — make sure no zombie
+        # grandchildren outlive us.
+        _kill_tree(proc, pgid=pgid)
+        raise
+    else:
+        # Happy path: pytest exited on its own. The child process already
+        # cleaned up its grandchildren if it's well-behaved, but
+        # well-behaved is not universal — kill the group anyway. Already-
+        # dead processes are a no-op.
+        _kill_tree(proc, pgid=pgid)
+
     if rc == 5:
         # No tests collected — every test in the file was filtered out.
         # Treat as a pass; surface info in a slightly distinct status
         # so the operator can spot it.
         rc = 0
-    return file, rc, proc.stdout
+    return file, rc, output
 
 
 def _print_progress(
@@ -159,6 +304,18 @@ def main() -> int:
         "--include-integration",
         action="store_true",
         help="Don't skip integration/ e2e/ during discovery",
+    )
+    parser.add_argument(
+        "--file-timeout",
+        type=float,
+        default=float(
+            os.environ.get("HERMES_TEST_FILE_TIMEOUT", _DEFAULT_FILE_TIMEOUT_SECONDS)
+        ),
+        help=(
+            "Per-file wall-clock cap in seconds. On timeout, the pytest "
+            "subprocess and its full process tree are SIGKILL'd. "
+            "Default: 600 (10 min), env: HERMES_TEST_FILE_TIMEOUT."
+        ),
     )
     args, pytest_passthrough = parser.parse_known_args()
 
@@ -208,7 +365,9 @@ def main() -> int:
         futures: List[Future] = []
         for file in files:
             t0 = time.monotonic()
-            fut = pool.submit(_run_one_file, file, pytest_passthrough, repo_root)
+            fut = pool.submit(
+                _run_one_file, file, pytest_passthrough, repo_root, args.file_timeout
+            )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)
         # Block until everything's done. ThreadPoolExecutor.__exit__ waits
