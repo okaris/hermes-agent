@@ -293,8 +293,8 @@ class InferenceShVideoGenProvider(VideoGenProvider):
             "name": "inference.sh",
             "badge": "paid",
             "tag": (
-                "Veo 3.1, Seedance 2.0, Wan 2.5, HappyHorse, Grok Video, P-Video "
-                "— one API key for all models (inference.sh)"
+                "One key for any model — Veo 3.1, Seedance 2.0, Wan 2.5, "
+                "HappyHorse, Grok Video, P-Video (inference.sh)"
             ),
             "env_vars": [
                 {

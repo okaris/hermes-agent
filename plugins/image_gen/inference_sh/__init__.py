@@ -206,8 +206,8 @@ class InferenceShImageGenProvider(ImageGenProvider):
             "name": "inference.sh",
             "badge": "paid",
             "tag": (
-                "FLUX, Seedream 4.5, GPT-Image-2, Gemini, Grok Imagine, Reve, P-Image "
-                "— one API key for all models (inference.sh)"
+                "One key for any model — FLUX, Seedream 4.5, GPT-Image-2, "
+                "Gemini, Grok Imagine, Reve, P-Image (inference.sh)"
             ),
             "env_vars": [
                 {
