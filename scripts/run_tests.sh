@@ -14,13 +14,17 @@
 #   * Proper venv activation (probes .venv, venv, then ~/.hermes/...)
 #
 # Usage:
-#   scripts/run_tests.sh                     # full suite, parallel
-#   scripts/run_tests.sh -j 4                # cap parallelism at 4
-#   scripts/run_tests.sh tests/agent/test_foo.py  # one file, serial
-#   scripts/run_tests.sh -- --tb=long -v     # pass-through pytest args
+#   scripts/run_tests.sh                            # full suite
+#   scripts/run_tests.sh -j 4                       # cap parallelism
+#   scripts/run_tests.sh tests/agent/               # discover only here
+#   scripts/run_tests.sh tests/agent/ tests/acp/    # multiple roots
+#   scripts/run_tests.sh tests/foo.py               # single file
+#   scripts/run_tests.sh tests/foo.py -- --tb=long  # path + pytest args
+#   scripts/run_tests.sh -- -v --tb=long            # pytest args only
 #
-# When given an explicit file path (a single .py argument), this delegates
-# directly to `python -m pytest <file>` — no parallel runner overhead.
+# Everything after a literal '--' is passed through to each per-file
+# pytest invocation. Positional path arguments before '--' override
+# the default discovery root (tests/).
 
 set -euo pipefail
 
@@ -89,15 +93,6 @@ fi
 
 # ── Run ─────────────────────────────────────────────────────────────────────
 cd "$REPO_ROOT"
-
-# Special-case: if the user passed a single .py file (or :: nodeid),
-# just run pytest directly on it — the parallel runner adds no value
-# for a one-file invocation and the direct path is faster + has full
-# pytest output piping.
-if [ "$#" -eq 1 ] && [[ "$1" == *.py* ]]; then
-  echo "▶ pytest $1 (single-file direct mode)"
-  exec "$PYTHON" -m pytest "$1"
-fi
 
 echo "▶ running per-file parallel test suite via run_tests_parallel.py"
 echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; all credential env vars unset)"

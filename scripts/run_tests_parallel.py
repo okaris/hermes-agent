@@ -66,12 +66,26 @@ _DEFAULT_FILE_TIMEOUT_SECONDS = 600.0  # 10 minutes
 def _discover_files(roots: List[Path]) -> List[Path]:
     """Return every ``test_*.py`` under the given roots (sorted).
 
-    Exclude any file whose path contains a component in ``_SKIP_PARTS``.
+    Roots may be directories (recursed for ``test_*.py``) or explicit
+    ``.py`` files (included as-is, even if they don't match the
+    ``test_*`` prefix — caller knows what they want).
+
+    Exclude any file whose path contains a component in ``_SKIP_PARTS``,
+    UNLESS the user explicitly named it as a root (in which case the
+    user's intent overrides the skip filter).
     """
     seen: set[Path] = set()
     out: List[Path] = []
     for root in roots:
         if not root.exists():
+            continue
+        if root.is_file():
+            # Explicit file: include it as-is, skip the _SKIP_PARTS filter
+            # since the user named it directly.
+            real = root.resolve()
+            if real not in seen:
+                seen.add(real)
+                out.append(root)
             continue
         for path in root.rglob("test_*.py"):
             if any(part in _SKIP_PARTS for part in path.parts):
@@ -317,10 +331,39 @@ def main() -> int:
             "Default: 600 (10 min), env: HERMES_TEST_FILE_TIMEOUT."
         ),
     )
-    args, pytest_passthrough = parser.parse_known_args()
+    parser.add_argument(
+        "paths_positional",
+        nargs="*",
+        metavar="PATH",
+        help=(
+            "Restrict discovery to these paths (directories or .py files). "
+            "Mutually exclusive with --paths. Anything after a literal '--' "
+            "separator is passed through to each per-file pytest invocation."
+        ),
+    )
+    # Manually split argv on '--' so positional paths and pytest passthrough
+    # args don't fight over each other. argparse's nargs="*" positional is
+    # greedy and will swallow everything after '--' including the pytest
+    # flags, defeating the convention.
+    argv = sys.argv[1:]
+    if "--" in argv:
+        sep = argv.index("--")
+        our_args, pytest_passthrough = argv[:sep], argv[sep + 1 :]
+    else:
+        our_args, pytest_passthrough = argv, []
+    args = parser.parse_args(our_args)
 
     repo_root = Path(__file__).resolve().parent.parent
-    roots = [repo_root / p for p in args.paths.split(":") if p]
+
+    # Resolve discovery roots: positional path args override --paths if any
+    # were supplied, otherwise --paths (which itself defaults to 'tests').
+    if args.paths_positional:
+        # Positionals can be directories OR explicit .py files. Either is
+        # fine — _discover_files handles both via rglob('test_*.py') for
+        # dirs and direct inclusion for files.
+        roots = [repo_root / p for p in args.paths_positional]
+    else:
+        roots = [repo_root / p for p in args.paths.split(":") if p]
 
     if args.include_integration:
         # Caller takes responsibility — typically used via explicit -k filter.
@@ -333,7 +376,8 @@ def main() -> int:
         return 1
 
     print(
-        f"Discovered {len(files)} test files under {':'.join(args.paths.split(':'))}; "
+        f"Discovered {len(files)} test files under "
+        f"{[str(r.relative_to(repo_root)) if r.is_relative_to(repo_root) else str(r) for r in roots]}; "
         f"running with -j {args.jobs}",
         flush=True,
     )
